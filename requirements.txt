@@ -1,7 +1,14 @@
+# Interface
 streamlit>=1.35.0
+
+# Leitura de PDF - texto nativo (múltiplas tentativas)
 PyPDF2>=3.0.1
 pdfplumber>=0.11.0
+
+# OCR - para PDFs com texto não extraível
 pytesseract>=0.3.10
 pdf2image>=1.17.0
 Pillow>=10.0.0
+
+# Utilitários
 lxml>=5.0.0
