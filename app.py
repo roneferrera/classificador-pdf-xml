@@ -41,43 +41,7 @@ def _limpar_texto(texto: str) -> str:
         .replace('\r', '\n')
     )
 
-def _extrair_chaves_candidatas(texto: str) -> list:
-    """
-    Retorna todas as sequências de 44 dígitos encontradas no texto,
-    usando múltiplas estratégias.
-    """
-    candidatas = []
-    texto = _limpar_texto(texto)
-
-    # Estratégia 1: 44 dígitos contínuos
-    for m in re.finditer(r'\d{44}', texto):
-        candidatas.append(m.group(0))
-
-    # Estratégia 2: 11 blocos de 4 dígitos separados por 1 espaço
-    for m in re.finditer(
-        r'(\d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4})',
-        texto
-    ):
-        candidatas.append(re.sub(r'\s+', '', m.group(1)))
-
-    # Estratégia 3: blocos de 4 dígitos com 1 a 4 espaços entre eles
-    for m in re.finditer(r'(\d{4}\s{1,4}){10}\d{4}', texto):
-        candidatas.append(re.sub(r'\D', '', m.group(0)))
-
-    # Estratégia 4: sequência mista dígitos+espaços que resulte em 44 dígitos
-    for m in re.finditer(r'\d[\d ]{42,58}\d', texto):
-        apenas = re.sub(r'\D', '', m.group(0))
-        if len(apenas) == 44:
-            candidatas.append(apenas)
-
-    return candidatas
-
-
 def _validar_chave_nfe(chave: str) -> bool:
-    """
-    Valida se a chave tem 44 dígitos e começa com código de estado válido.
-    Estados brasileiros: 11-17, 21-29, 31-35, 41-43, 50-53
-    """
     if not chave or len(chave) != 44 or not chave.isdigit():
         return False
     cuf = int(chave[:2])
@@ -90,46 +54,77 @@ def _validar_chave_nfe(chave: str) -> bool:
     )
     return cuf in estados_validos
 
+def _extrair_chaves_candidatas(texto: str) -> list:
+    candidatas = []
+    texto = _limpar_texto(texto)
+
+    # 1: 44 dígitos contínuos
+    for m in re.finditer(r'\d{44}', texto):
+        candidatas.append(m.group(0))
+
+    # 2: 11 blocos de 4 dígitos com espaço simples
+    for m in re.finditer(
+        r'(\d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4})',
+        texto
+    ):
+        candidatas.append(re.sub(r'\s+', '', m.group(1)))
+
+    # 3: blocos de 4 dígitos com 1 a 4 espaços
+    for m in re.finditer(r'(\d{4}\s{1,4}){10}\d{4}', texto):
+        candidatas.append(re.sub(r'\D', '', m.group(0)))
+
+    # 4: sequência mista que resulte em 44 dígitos
+    for m in re.finditer(r'\d[\d ]{42,58}\d', texto):
+        apenas = re.sub(r'\D', '', m.group(0))
+        if len(apenas) == 44:
+            candidatas.append(apenas)
+
+    return candidatas
 
 def _buscar_chave_no_texto(texto: str):
     candidatas = _extrair_chaves_candidatas(texto)
     for c in candidatas:
         if _validar_chave_nfe(c):
             return c
-    # fallback: retorna qualquer candidata de 44 dígitos mesmo sem validação
     for c in candidatas:
         if len(c) == 44 and c.isdigit():
             return c
     return None
 
-
 def _buscar_chave_por_contexto(texto: str):
     """
     Busca especificamente na linha após 'CHAVE DE ACESSO'.
-    Funciona para todos os layouts de DANFE encontrados.
+    Cobre todos os layouts: Keysystems, Venus, SICER, GAPLAN.
     """
     texto = _limpar_texto(texto)
     linhas = texto.split('\n')
 
     for i, linha in enumerate(linhas):
         if 'CHAVE DE ACESSO' in linha.upper():
-            # Verifica a própria linha e as 3 seguintes
-            for j in range(i, min(i + 4, len(linhas))):
+
+            # Tenta extrair da própria linha (ex: SES COMERCIO - chave inline)
+            chave = _buscar_chave_no_texto(linha)
+            if chave:
+                return chave
+
+            # Verifica as próximas 5 linhas
+            for j in range(i + 1, min(i + 6, len(linhas))):
                 chave = _buscar_chave_no_texto(linhas[j])
                 if chave:
                     return chave
-            # Tenta concatenar as próximas linhas (chave quebrada)
-            bloco = ' '.join(linhas[i:min(i+5, len(linhas))])
+
+            # Tenta juntar as próximas linhas (chave quebrada entre linhas)
+            bloco = ' '.join(linhas[i:min(i + 6, len(linhas))])
             chave = _buscar_chave_no_texto(bloco)
             if chave:
                 return chave
-    return None
 
+    return None
 
 def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
     """
     Extrai a chave de acesso NF-e do PDF.
-    Ordem: pdfplumber (contexto → página) → PyPDF2 → OCR
+    Ordem: pdfplumber → PyPDF2 → OCR
     """
 
     # ── pdfplumber ─────────────────────────────────────────────────────────────
@@ -174,23 +169,22 @@ def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
                             if chave:
                                 return chave, "texto"
 
-                            # Tenta concatenar só os dígitos da linha
                             so_digitos = re.sub(r'\D', '', linha)
                             if len(so_digitos) >= 44:
                                 for start in range(len(so_digitos) - 43):
-                                    candidata = so_digitos[start:start+44]
+                                    candidata = so_digitos[start:start + 44]
                                     if _validar_chave_nfe(candidata):
                                         return candidata, "texto"
                     except Exception:
                         pass
 
-                    # 5. Busca por regiões (bbox) — região superior direita do DANFE
+                    # 5. Busca por regiões (bbox)
                     try:
                         w, h = float(page.width), float(page.height)
                         regioes = [
-                            (w * 0.35, 0,      w,     h * 0.30),  # superior direita
-                            (0,        0,      w,     h * 0.25),  # superior completa
-                            (w * 0.35, h*0.05, w,     h * 0.40),  # meio direita
+                            (w * 0.35, 0,       w, h * 0.30),
+                            (0,        0,       w, h * 0.25),
+                            (w * 0.35, h * 0.05, w, h * 0.40),
                         ]
                         for bbox in regioes:
                             try:
@@ -283,7 +277,6 @@ def ler_estrutura_zip(zip_bytes: bytes) -> list:
         st.error("ZIP inválido ou corrompido.")
     return resultado
 
-
 def ler_xmls_zip(zip_bytes: bytes) -> list:
     resultado = []
     try:
@@ -305,7 +298,6 @@ def ler_xmls_zip(zip_bytes: bytes) -> list:
         st.error("ZIP de XMLs inválido ou corrompido.")
     return resultado
 
-
 def normalizar_pdfs(uploads) -> list:
     resultado = []
     for f in uploads:
@@ -321,7 +313,6 @@ def normalizar_pdfs(uploads) -> list:
                 "caminho":   f.name
             })
     return resultado
-
 
 def normalizar_xmls(uploads) -> list:
     resultado = []
@@ -355,7 +346,6 @@ def extrair_chave_xml(xml_bytes: bytes) -> str:
         pass
     return None
 
-
 def extrair_info_xml(xml_bytes: bytes) -> dict:
     info = {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"}
     try:
@@ -372,7 +362,6 @@ def extrair_info_xml(xml_bytes: bytes) -> dict:
     except Exception:
         pass
     return info
-
 
 def gerar_zip_saida(notas: dict) -> bytes:
     buf = io.BytesIO()
@@ -398,12 +387,11 @@ st.markdown(
 
 status_libs = []
 if PDFPLUMBER_DISPONIVEL: status_libs.append("✅ pdfplumber")
-else: status_libs.append("❌ pdfplumber")
-if PYPDF2_DISPONIVEL: status_libs.append("✅ PyPDF2")
-else: status_libs.append("❌ PyPDF2")
-if OCR_DISPONIVEL: status_libs.append("✅ OCR (Tesseract)")
-else: status_libs.append("⚠️ OCR indisponível")
-
+else:                      status_libs.append("❌ pdfplumber")
+if PYPDF2_DISPONIVEL:      status_libs.append("✅ PyPDF2")
+else:                      status_libs.append("❌ PyPDF2")
+if OCR_DISPONIVEL:         status_libs.append("✅ OCR (Tesseract)")
+else:                      status_libs.append("⚠️ OCR indisponível")
 st.info("  |  ".join(status_libs))
 
 with st.expander("📖 Estrutura esperada do ZIP de PDFs"):
@@ -470,11 +458,11 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
             else:
                 st.info("Nenhum PDF enviado.")
 
-        total       = max(len(lista_pdfs) + len(lista_xmls), 1)
-        processados = 0
-        lidos_texto = 0
-        lidos_ocr   = 0
-        falhou_leit = 0
+        total        = max(len(lista_pdfs) + len(lista_xmls), 1)
+        processados  = 0
+        lidos_texto  = 0
+        lidos_ocr    = 0
+        falhou_leit  = 0
 
         # Indexa XMLs pela chave
         xmls_por_chave = {}
@@ -560,14 +548,41 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
         st.session_state.notas      = notas
         st.session_state.processado = True
 
-        cruzados = sum(1 for n in notas.values() if n["status"] == "✅ Cruzado")
-        sem_pdf  = sum(1 for n in notas.values() if not n["tem_pdf"])
+        # ── Métricas ───────────────────────────────────────────────────────────
+        total_pdfs = len(lista_pdfs)
+        total_xmls = len(lista_xmls)
+        cruzados   = sum(1 for n in notas.values() if n["status"] == "✅ Cruzado")
+        sem_pdf    = sum(1 for n in notas.values() if not n["tem_pdf"])
+        sem_xml    = sum(1 for n in notas.values() if n["tem_pdf"] and n["xml_bytes"] is None)
+        sem_chave  = sum(1 for n in notas.values() if n["status"] == "❌ Chave não extraída do PDF")
 
-        col_a, col_b, col_c, col_d = st.columns(4)
-        col_a.metric("Total",       len(notas))
-        col_b.metric("✅ Cruzadas",  cruzados)
-        col_c.metric("🔍 Via OCR",   lidos_ocr)
-        col_d.metric("⚠️ Sem PDF",   sem_pdf)
+        st.divider()
+        st.subheader("📊 Resultado do Processamento")
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("📄 PDFs recebidos", total_pdfs)
+        col_b.metric("🗂️ XMLs recebidos", total_xmls)
+        col_c.metric("✅ Cruzamentos OK",  cruzados)
+
+        col_d, col_e, col_f = st.columns(3)
+        col_d.metric("❌ Chave não lida",  sem_chave)
+        col_e.metric("⚠️ PDF sem XML",     sem_xml)
+        col_f.metric("⚠️ XML sem PDF",     sem_pdf)
+
+        st.divider()
+        if cruzados == total_pdfs == total_xmls:
+            st.success(f"✅ Tudo certo! {cruzados} PDF(s) cruzados com {cruzados} XML(s). Nenhuma divergência.")
+        else:
+            st.warning(
+                f"⚠️ **Divergência:** {total_pdfs} PDF(s) × "
+                f"{total_xmls} XML(s) × {cruzados} cruzamento(s) OK."
+            )
+            if sem_chave > 0:
+                st.error(f"❌ {sem_chave} PDF(s) com chave não extraída.")
+            if sem_xml > 0:
+                st.warning(f"⚠️ {sem_xml} PDF(s) sem XML correspondente.")
+            if sem_pdf > 0:
+                st.warning(f"⚠️ {sem_pdf} XML(s) sem PDF correspondente.")
 
         if lidos_ocr   > 0: st.info(f"🔍 {lidos_ocr} PDF(s) lidos via OCR.")
         if falhou_leit > 0: st.warning(f"❌ {falhou_leit} PDF(s) não tiveram a chave extraída.")
@@ -591,8 +606,10 @@ if st.session_state.processado and st.session_state.notas:
         with col_btn:
             st.write(""); st.write("")
             if st.button("✅ Aplicar", use_container_width=True):
-                for chave in sem_pdf_notas:
-                    st.session_state.notas[chave]["categoria"] = cat_escolhida
+                # Atualiza TODAS as notas sem PDF diretamente no session_state
+                for chave in list(st.session_state.notas.keys()):
+                    if not st.session_state.notas[chave]["tem_pdf"]:
+                        st.session_state.notas[chave]["categoria"] = cat_escolhida
                 st.session_state.cat_sem_pdf = cat_escolhida
                 st.success(f"**{cat_escolhida}** aplicado a {len(sem_pdf_notas)} XML(s).")
                 st.rerun()
@@ -630,8 +647,18 @@ if st.session_state.processado and st.session_state.notas:
         cols[5].caption(dados["info"]["cfop"])
         cols[6].caption(dados.get("metodo_pdf","—"))
 
-        idx      = categorias_opcoes.index(dados["categoria"]) if dados["categoria"] in categorias_opcoes else 0
-        nova_cat = cols[7].selectbox("", categorias_opcoes, index=idx, key=f"cat_{chave}", label_visibility="collapsed")
+        # Index sempre reflete a categoria atual da nota
+        cat_atual = dados["categoria"]
+        if cat_atual not in categorias_opcoes:
+            cat_atual = categorias_opcoes[0]
+        idx = categorias_opcoes.index(cat_atual)
+
+        nova_cat = cols[7].selectbox(
+            "", categorias_opcoes,
+            index=idx,
+            key=f"cat_{chave}",
+            label_visibility="collapsed"
+        )
         dados["categoria"] = nova_cat
 
         badge = {"✅":"🟢","⚠️":"🟡","❌":"🔴"}.get(dados["status"][0],"⚪")
@@ -640,7 +667,7 @@ if st.session_state.processado and st.session_state.notas:
 
     st.session_state.notas = notas_att
 
-    # ── Resumo ─────────────────────────────────────────────────────────────────
+    # ── Resumo por categoria ────────────────────────────────────────────────────
     st.divider()
     st.subheader("📊 Resumo por Categoria")
     resumo = {}
@@ -657,20 +684,16 @@ if st.session_state.processado and st.session_state.notas:
     st.subheader("📦 4. Download")
     com_xml = {k: v for k, v in st.session_state.notas.items() if v["xml_bytes"]}
     if com_xml:
-        ainda_sem_cat = sum(1 for v in com_xml.values() if not v["tem_pdf"] and v["categoria"] == CATEGORIA_PADRAO)
+        ainda_sem_cat = sum(
+            1 for v in com_xml.values()
+            if not v["tem_pdf"] and v["categoria"] == CATEGORIA_PADRAO
+        )
         if ainda_sem_cat:
-            st.warning(f"⚠️ {ainda_sem_cat} XML(s) ainda em **'{CATEGORIA_PADRAO}'**. Aplique uma categoria acima.")
-
+            st.warning(
+                f"⚠️ {ainda_sem_cat} XML(s) ainda em **'{CATEGORIA_PADRAO}'**. "
+                "Aplique uma categoria acima antes de baixar."
+            )
         zip_bytes = gerar_zip_saida(com_xml)
-        pastas    = sorted(set(v["categoria"] for v in com_xml.values()))
-        estrutura = ""
-        for pasta in pastas:
-            xmls_pasta = [v["xml_nome"] for v in com_xml.values() if v["categoria"] == pasta]
-            estrutura += f"📁 {pasta}/  ({len(xmls_pasta)} arquivo(s))\n"
-            for nome in xmls_pasta:
-                estrutura += f"   └── {nome}\n"
-        st.code(estrutura, language=None)
-
         st.download_button(
             "⬇️ Baixar XMLs Classificados (.zip)",
             data=zip_bytes,
