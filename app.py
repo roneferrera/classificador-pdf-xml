@@ -6,14 +6,85 @@ import os
 import xml.etree.ElementTree as ET
 from PyPDF2 import PdfReader
 
+# OCR — importação segura (não quebra se não estiver instalado)
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_DISPONIVEL = True
+except ImportError:
+    OCR_DISPONIVEL = False
+
 # ─────────────────────────────────────────────
 # CONFIGURAÇÕES
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Classificador NF-e", layout="wide", page_icon="📂")
 
-NAMESPACE_NFE   = "http://www.portalfiscal.inf.br/nfe"
+NAMESPACE_NFE    = "http://www.portalfiscal.inf.br/nfe"
 CATEGORIA_PADRAO = "Sem Categoria"
-CATEGORIAS_FIXAS = ["Geral", "Revenda", "Ativo", "Consumo", "Materia Prima", "Remessa"]
+
+# Regex da chave de acesso NF-e (44 dígitos)
+REGEX_CHAVE_CONTINUA = re.compile(r'\b(\d{44})\b')
+REGEX_CHAVE_BLOCOS   = re.compile(r'(\d{4}[\s]{1,3}){10}\d{4}')
+
+# ─────────────────────────────────────────────
+# EXTRAÇÃO DE CHAVE DO PDF
+# ─────────────────────────────────────────────
+
+def _buscar_chave_no_texto(texto: str):
+    """Tenta extrair chave de 44 dígitos de um texto bruto."""
+    # Formato 1: 44 dígitos contínuos
+    m = REGEX_CHAVE_CONTINUA.search(texto)
+    if m:
+        return m.group(1)
+
+    # Formato 2: blocos de 4 dígitos separados por espaço (DANFE padrão)
+    m = REGEX_CHAVE_BLOCOS.search(texto)
+    if m:
+        return re.sub(r'\s+', '', m.group(0))
+
+    return None
+
+
+def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Tenta extrair a chave de acesso do PDF em duas etapas:
+      1. Leitura de texto nativo (PyPDF2) — PDFs digitais
+      2. OCR via pytesseract              — PDFs escaneados / imagem
+
+    Retorna: (chave_str | None, metodo_str)
+      metodo pode ser: "texto", "ocr", "falhou"
+    """
+    # ── Etapa 1: texto nativo ──────────────────────────────────────────────────
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        texto  = "".join(p.extract_text() or "" for p in reader.pages)
+        chave  = _buscar_chave_no_texto(texto)
+        if chave:
+            return chave, "texto"
+    except Exception:
+        pass
+
+    # ── Etapa 2: OCR (somente se pytesseract estiver disponível) ───────────────
+    if OCR_DISPONIVEL:
+        try:
+            # Converte cada página do PDF em imagem (300 DPI para melhor precisão)
+            paginas = convert_from_bytes(pdf_bytes, dpi=300)
+            texto_ocr = ""
+            for pagina in paginas:
+                # lang="por+eng" reconhece português e inglês
+                texto_ocr += pytesseract.image_to_string(
+                    pagina,
+                    lang="por+eng",
+                    config="--oem 3 --psm 6"
+                )
+            chave = _buscar_chave_no_texto(texto_ocr)
+            if chave:
+                return chave, "ocr"
+        except Exception:
+            pass
+
+    return None, "falhou"
+
 
 # ─────────────────────────────────────────────
 # LEITURA DO ZIP
@@ -119,21 +190,6 @@ def normalizar_xmls(uploads) -> list:
 # FUNÇÕES NF-e
 # ─────────────────────────────────────────────
 
-def extrair_chave_pdf(pdf_bytes: bytes) -> str:
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        texto  = "".join(p.extract_text() or "" for p in reader.pages)
-        m = re.search(r'\b(\d{44})\b', texto)
-        if m:
-            return m.group(1)
-        m = re.search(r'(\d{4}[\s]{1,3}){10}\d{4}', texto)
-        if m:
-            return re.sub(r'\s+', '', m.group(0))
-        return None
-    except Exception:
-        return None
-
-
 def extrair_chave_xml(xml_bytes: bytes) -> str:
     try:
         root = ET.fromstring(xml_bytes)
@@ -160,9 +216,9 @@ def extrair_info_xml(xml_bytes: bytes) -> dict:
         def tag(t):
             return root.find(".//{%s}%s" % (NAMESPACE_NFE, t))
 
-        if tag("nNF")  is not None: info["numero"]   = tag("nNF").text
-        if tag("vNF")  is not None: info["valor"]    = f"R$ {float(tag('vNF').text):,.2f}"
-        if tag("CFOP") is not None: info["cfop"]     = tag("CFOP").text
+        if tag("nNF")  is not None: info["numero"]  = tag("nNF").text
+        if tag("vNF")  is not None: info["valor"]   = f"R$ {float(tag('vNF').text):,.2f}"
+        if tag("CFOP") is not None: info["cfop"]    = tag("CFOP").text
 
         xNome = root.find(".//{%s}emit/{%s}xNome" % (NAMESPACE_NFE, NAMESPACE_NFE)) or tag("xNome")
         if xNome is not None: info["emitente"] = xNome.text
@@ -194,8 +250,18 @@ def gerar_zip_saida(notas: dict) -> bytes:
 st.title("📂 Classificador de NF-e por Categoria")
 st.markdown(
     "A categoria é definida automaticamente pelo **nome da pasta mãe** do PDF dentro do ZIP. "
-    "XMLs sem PDF correspondente recebem uma **categoria geral** definida por você."
+    "XMLs sem PDF correspondente recebem a categoria que você escolher."
 )
+
+# Aviso sobre OCR
+if OCR_DISPONIVEL:
+    st.success("🔍 OCR ativo — PDFs escaneados (imagem) também serão lidos automaticamente via Tesseract.")
+else:
+    st.warning(
+        "⚠️ OCR não disponível. Apenas PDFs com texto nativo serão lidos. "
+        "Para habilitar OCR instale: `pip install pytesseract pdf2image Pillow` "
+        "e os binários **Tesseract** e **Poppler**."
+    )
 
 with st.expander("📖 Estrutura esperada do ZIP"):
     st.code(
@@ -207,8 +273,7 @@ with st.expander("📖 Estrutura esperada do ZIP"):
         "└── nfe003.pdf        →  categoria = Sem Categoria\n\n"
         "📦 xmls.zip  (estrutura de pastas ignorada)\n"
         "├── nfe001.xml\n"
-        "├── nfe002.xml\n"
-        "└── nfe003.xml",
+        "└── nfe002.xml",
         language=None
     )
 
@@ -216,8 +281,8 @@ with st.expander("📖 Estrutura esperada do ZIP"):
 for key, default in [
     ("notas", {}),
     ("processado", False),
-    ("categorias", [CATEGORIA_PADRAO]),
-    ("cat_sem_pdf", CATEGORIAS_FIXAS[0]),
+    ("categorias", []),
+    ("cat_sem_pdf", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -257,16 +322,28 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
         lista_xmls = normalizar_xmls(xmls_uploaded or [])
 
         # Categorias detectadas pelas pastas dos PDFs
-        categorias_detectadas = sorted(set(p["categoria"] for p in lista_pdfs))
-        st.session_state.categorias = categorias_detectadas or [CATEGORIA_PADRAO]
+        categorias_detectadas = sorted(set(
+            p["categoria"] for p in lista_pdfs
+            if p["categoria"] != CATEGORIA_PADRAO
+        ))
+        st.session_state.categorias  = categorias_detectadas if categorias_detectadas else [CATEGORIA_PADRAO]
+        st.session_state.cat_sem_pdf = categorias_detectadas[0] if categorias_detectadas else CATEGORIA_PADRAO
 
         # Log da estrutura detectada
         with st.expander("🗂️ Estrutura detectada no ZIP de PDFs", expanded=True):
-            for p in lista_pdfs:
-                st.caption(f"📄 `{p['caminho']}`  →  📁 **{p['categoria']}**")
+            if lista_pdfs:
+                for p in lista_pdfs:
+                    st.caption(f"📄 `{p['caminho']}`  →  📁 **{p['categoria']}**")
+            else:
+                st.info("Nenhum PDF enviado.")
 
         total       = max(len(lista_pdfs) + len(lista_xmls), 1)
         processados = 0
+
+        # Contadores de método de leitura
+        lidos_texto = 0
+        lidos_ocr   = 0
+        falhou_leit = 0
 
         # Indexa XMLs pela chave
         xmls_por_chave = {}
@@ -283,114 +360,144 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
             processados += 1
             progress.progress(processados / total, text=f"Indexando XMLs... {processados}/{total}")
 
-        # Cruza PDFs → XMLs; categoria vem da pasta do PDF
+        # Cruza PDFs → XMLs
         chaves_pdf = set()
         for arq in lista_pdfs:
-            chave     = extrair_chave_pdf(arq["bytes"])
-            categoria = arq["categoria"]
+            progress.progress(
+                processados / total,
+                text=f"Lendo PDF: {arq['nome']}..."
+            )
+
+            chave, metodo = extrair_chave_pdf(arq["bytes"])
+            categoria     = arq["categoria"]
+
+            # Contabiliza método
+            if metodo == "texto":
+                lidos_texto += 1
+            elif metodo == "ocr":
+                lidos_ocr += 1
+            else:
+                falhou_leit += 1
+
+            # Define badge do método de leitura
+            badge_metodo = {
+                "texto":  "📄 texto",
+                "ocr":    "🔍 OCR",
+                "falhou": "❌ falhou"
+            }.get(metodo, "")
 
             if chave:
                 chaves_pdf.add(chave)
                 if chave in xmls_por_chave:
                     notas[chave] = {
-                        "pdf_nome":  arq["nome"],
-                        "xml_nome":  xmls_por_chave[chave]["nome"],
-                        "xml_bytes": xmls_por_chave[chave]["bytes"],
-                        "info":      xmls_por_chave[chave]["info"],
-                        "categoria": categoria,
-                        "tem_pdf":   True,
-                        "status":    "✅ Cruzado"
+                        "pdf_nome":    arq["nome"],
+                        "xml_nome":    xmls_por_chave[chave]["nome"],
+                        "xml_bytes":   xmls_por_chave[chave]["bytes"],
+                        "info":        xmls_por_chave[chave]["info"],
+                        "categoria":   categoria,
+                        "tem_pdf":     True,
+                        "metodo_pdf":  badge_metodo,
+                        "status":      "✅ Cruzado"
                     }
                 else:
                     notas[chave] = {
-                        "pdf_nome":  arq["nome"],
-                        "xml_nome":  None,
-                        "xml_bytes": None,
-                        "info":      {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"},
-                        "categoria": categoria,
-                        "tem_pdf":   True,
-                        "status":    "⚠️ XML não encontrado"
+                        "pdf_nome":    arq["nome"],
+                        "xml_nome":    None,
+                        "xml_bytes":   None,
+                        "info":        {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"},
+                        "categoria":   categoria,
+                        "tem_pdf":     True,
+                        "metodo_pdf":  badge_metodo,
+                        "status":      "⚠️ XML não encontrado"
                     }
             else:
                 notas[f"sem_chave_{arq['nome']}"] = {
-                    "pdf_nome":  arq["nome"],
-                    "xml_nome":  None,
-                    "xml_bytes": None,
-                    "info":      {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"},
-                    "categoria": categoria,
-                    "tem_pdf":   True,
-                    "status":    "❌ Chave não extraída do PDF"
+                    "pdf_nome":    arq["nome"],
+                    "xml_nome":    None,
+                    "xml_bytes":   None,
+                    "info":        {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"},
+                    "categoria":   categoria,
+                    "tem_pdf":     True,
+                    "metodo_pdf":  badge_metodo,
+                    "status":      "❌ Chave não extraída do PDF"
                 }
             processados += 1
             progress.progress(processados / total, text=f"Cruzando PDFs... {processados}/{total}")
 
-        # ── XMLs sem PDF correspondente → marcados com tem_pdf=False ──────────
+        # XMLs sem PDF correspondente
         for chave, dados in xmls_por_chave.items():
             if chave not in chaves_pdf:
                 notas[chave] = {
-                    "pdf_nome":  None,
-                    "xml_nome":  dados["nome"],
-                    "xml_bytes": dados["bytes"],
-                    "info":      dados["info"],
-                    "categoria": CATEGORIA_PADRAO,   # será sobrescrito pelo seletor
-                    "tem_pdf":   False,              # ← flag para o seletor
-                    "status":    "⚠️ PDF não encontrado"
+                    "pdf_nome":    None,
+                    "xml_nome":    dados["nome"],
+                    "xml_bytes":   dados["bytes"],
+                    "info":        dados["info"],
+                    "categoria":   CATEGORIA_PADRAO,
+                    "tem_pdf":     False,
+                    "metodo_pdf":  "—",
+                    "status":      "⚠️ PDF não encontrado"
                 }
 
         progress.progress(1.0, text="Concluído!")
         st.session_state.notas      = notas
         st.session_state.processado = True
 
-        cruzados  = sum(1 for n in notas.values() if n["status"] == "✅ Cruzado")
-        sem_pdf   = sum(1 for n in notas.values() if not n["tem_pdf"])
-        st.success(
-            f"✅ {len(notas)} nota(s) processada(s) — "
-            f"{cruzados} cruzada(s) | "
-            f"{sem_pdf} sem PDF"
-        )
+        # Resumo do processamento
+        cruzados = sum(1 for n in notas.values() if n["status"] == "✅ Cruzado")
+        sem_pdf  = sum(1 for n in notas.values() if not n["tem_pdf"])
 
-# ─── Seletor de categoria para XMLs sem PDF ────────────────────────────────────
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("Total de notas",   len(notas))
+        col_b.metric("✅ Cruzadas",       cruzados)
+        col_c.metric("🔍 Lidas via OCR",  lidos_ocr)
+        col_d.metric("⚠️ Sem PDF",        sem_pdf)
+
+        if lidos_ocr > 0:
+            st.info(f"🔍 {lidos_ocr} PDF(s) eram imagem e foram lidos via OCR.")
+        if falhou_leit > 0:
+            st.warning(f"❌ {falhou_leit} PDF(s) não tiveram a chave extraída nem por texto nem por OCR.")
+
+# ─── Seletor para XMLs sem PDF ─────────────────────────────────────────────────
 if st.session_state.processado and st.session_state.notas:
     sem_pdf_notas = {k: v for k, v in st.session_state.notas.items() if not v["tem_pdf"]}
 
     if sem_pdf_notas:
         st.divider()
-
-        # Destaque visual
         st.warning(
-            f"⚠️ **{len(sem_pdf_notas)} XML(s) sem PDF correspondente** foram encontrados. "
-            "Selecione a categoria que será aplicada a todos eles:"
+            f"⚠️ **{len(sem_pdf_notas)} XML(s) sem PDF** encontrado(s). "
+            "Escolha em qual categoria classificá-los:"
         )
 
-        col_sel, col_btn = st.columns([3, 1])
+        categorias_opcoes = st.session_state.categorias
 
+        col_sel, col_btn = st.columns([3, 1])
         with col_sel:
             cat_escolhida = st.selectbox(
-                "📁 Categoria para XMLs sem PDF:",
-                options=CATEGORIAS_FIXAS,
-                index=CATEGORIAS_FIXAS.index(st.session_state.cat_sem_pdf)
-                      if st.session_state.cat_sem_pdf in CATEGORIAS_FIXAS else 0,
+                "📁 Classificar XMLs sem PDF em:",
+                options=categorias_opcoes,
+                index=(
+                    categorias_opcoes.index(st.session_state.cat_sem_pdf)
+                    if st.session_state.cat_sem_pdf in categorias_opcoes else 0
+                ),
                 key="sel_cat_sem_pdf",
-                help="Esta categoria será aplicada a todos os XMLs que não possuem um PDF (DANFE) correspondente."
+                help="As opções são as pastas detectadas no ZIP de PDFs."
             )
-
         with col_btn:
             st.write("")
             st.write("")
-            if st.button("✅ Aplicar categoria", use_container_width=True):
+            if st.button("✅ Aplicar", use_container_width=True):
                 for chave in sem_pdf_notas:
                     st.session_state.notas[chave]["categoria"] = cat_escolhida
                 st.session_state.cat_sem_pdf = cat_escolhida
-                st.success(f"Categoria **{cat_escolhida}** aplicada a {len(sem_pdf_notas)} XML(s).")
+                st.success(f"**{cat_escolhida}** aplicado a {len(sem_pdf_notas)} XML(s).")
                 st.rerun()
 
-        # Lista dos XMLs sem PDF
         with st.expander(f"📋 Ver os {len(sem_pdf_notas)} XML(s) sem PDF"):
             cols_h = st.columns([3, 2.5, 1.5, 1.5, 1, 2])
-            for col, lbl in zip(cols_h, ["**XML**", "**Emitente**", "**Nº NF**", "**Valor**", "**CFOP**", "**Categoria Atual**"]):
+            for col, lbl in zip(cols_h, ["**XML**","**Emitente**","**Nº NF**","**Valor**","**CFOP**","**Categoria Atual**"]):
                 col.markdown(lbl)
             st.divider()
-            for chave, dados in sem_pdf_notas.items():
+            for dados in sem_pdf_notas.values():
                 cols = st.columns([3, 2.5, 1.5, 1.5, 1, 2])
                 cols[0].caption(dados["xml_nome"] or "—")
                 cols[1].caption((dados["info"]["emitente"] or "")[:30])
@@ -403,20 +510,20 @@ if st.session_state.processado and st.session_state.notas:
 if st.session_state.processado and st.session_state.notas:
     st.divider()
     st.subheader("🏷️ 3. Revisão Geral")
-    st.caption("Ajuste individual se necessário. Categoria dos PDFs vem da pasta; XMLs sem PDF usam a categoria selecionada acima.")
+    st.caption("A coluna **Leitura** indica se a chave foi extraída por texto nativo ou OCR.")
 
-    # Todas as categorias possíveis (pasta + fixas), sem duplicatas
-    todas_cats = sorted(set(st.session_state.categorias) | set(CATEGORIAS_FIXAS))
+    categorias_opcoes = st.session_state.categorias
 
     col_f1, col_f2 = st.columns(2)
     filtro_status = col_f1.selectbox(
         "Status:",
-        ["Todos", "✅ Cruzado", "⚠️ XML não encontrado", "⚠️ PDF não encontrado", "❌ Chave não extraída do PDF"]
+        ["Todos","✅ Cruzado","⚠️ XML não encontrado","⚠️ PDF não encontrado","❌ Chave não extraída do PDF"]
     )
-    filtro_cat = col_f2.selectbox("Categoria:", ["Todas"] + todas_cats)
+    filtro_cat = col_f2.selectbox("Categoria:", ["Todas"] + categorias_opcoes)
 
-    cols_h = st.columns([2.5, 2.5, 2.5, 1, 1.5, 1, 2, 2])
-    for col, lbl in zip(cols_h, ["**PDF**","**XML**","**Emitente**","**Nº**","**Valor**","**CFOP**","**Categoria**","**Status**"]):
+    # Cabeçalho com coluna extra "Leitura"
+    cols_h = st.columns([2, 2, 2.5, 1, 1.5, 1, 1.5, 2, 1.5])
+    for col, lbl in zip(cols_h, ["**PDF**","**XML**","**Emitente**","**Nº**","**Valor**","**CFOP**","**Leitura**","**Categoria**","**Status**"]):
         col.markdown(lbl)
     st.divider()
 
@@ -427,20 +534,21 @@ if st.session_state.processado and st.session_state.notas:
         if filtro_cat != "Todas" and dados["categoria"] != filtro_cat:
             notas_att[chave] = dados; continue
 
-        cols = st.columns([2.5, 2.5, 2.5, 1, 1.5, 1, 2, 2])
+        cols = st.columns([2, 2, 2.5, 1, 1.5, 1, 1.5, 2, 1.5])
         cols[0].caption(dados["pdf_nome"] or "—")
         cols[1].caption(dados["xml_nome"] or "—")
         cols[2].caption((dados["info"]["emitente"] or "")[:30])
         cols[3].caption(dados["info"]["numero"])
         cols[4].caption(dados["info"]["valor"])
         cols[5].caption(dados["info"]["cfop"])
+        cols[6].caption(dados.get("metodo_pdf", "—"))   # ← 📄 texto | 🔍 OCR
 
-        idx      = todas_cats.index(dados["categoria"]) if dados["categoria"] in todas_cats else 0
-        nova_cat = cols[6].selectbox("", todas_cats, index=idx, key=f"cat_{chave}", label_visibility="collapsed")
+        idx      = categorias_opcoes.index(dados["categoria"]) if dados["categoria"] in categorias_opcoes else 0
+        nova_cat = cols[7].selectbox("", categorias_opcoes, index=idx, key=f"cat_{chave}", label_visibility="collapsed")
         dados["categoria"] = nova_cat
 
-        badge = {"✅": "🟢", "⚠️": "🟡", "❌": "🔴"}.get(dados["status"][0], "⚪")
-        cols[7].caption(f"{badge} {dados['status'][2:].strip()}")
+        badge = {"✅":"🟢","⚠️":"🟡","❌":"🔴"}.get(dados["status"][0],"⚪")
+        cols[8].caption(f"{badge} {dados['status'][2:].strip()}")
         notas_att[chave] = dados
 
     st.session_state.notas = notas_att
@@ -452,7 +560,7 @@ if st.session_state.processado and st.session_state.notas:
     for d in st.session_state.notas.values():
         resumo[d["categoria"]] = resumo.get(d["categoria"], 0) + 1
 
-    cats_com_notas = [c for c in todas_cats if c in resumo]
+    cats_com_notas = [c for c in categorias_opcoes if c in resumo]
     if cats_com_notas:
         cols_r = st.columns(len(cats_com_notas))
         for i, cat in enumerate(cats_com_notas):
@@ -465,7 +573,6 @@ if st.session_state.processado and st.session_state.notas:
     com_xml = {k: v for k, v in st.session_state.notas.items() if v["xml_bytes"]}
 
     if com_xml:
-        # Avisa se ainda tem XMLs sem PDF com categoria padrão
         ainda_sem_cat = sum(
             1 for v in com_xml.values()
             if not v["tem_pdf"] and v["categoria"] == CATEGORIA_PADRAO
@@ -479,7 +586,6 @@ if st.session_state.processado and st.session_state.notas:
         zip_bytes = gerar_zip_saida(com_xml)
         pastas    = sorted(set(v["categoria"] for v in com_xml.values()))
 
-        # Preview da estrutura
         estrutura = ""
         for pasta in pastas:
             xmls_pasta = [v["xml_nome"] for v in com_xml.values() if v["categoria"] == pasta]
@@ -500,4 +606,4 @@ if st.session_state.processado and st.session_state.notas:
         st.warning("Nenhum XML disponível para exportar.")
 
 st.divider()
-st.caption("💡 Categoria automática pela pasta do PDF | XMLs sem PDF → categoria definida pelo seletor")
+st.caption("💡 PDFs digitais → leitura direta | PDFs escaneados → OCR automático via Tesseract")
