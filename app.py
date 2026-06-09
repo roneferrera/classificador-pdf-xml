@@ -58,22 +58,18 @@ def _extrair_chaves_candidatas(texto: str) -> list:
     candidatas = []
     texto = _limpar_texto(texto)
 
-    # 1: 44 dígitos contínuos
     for m in re.finditer(r'\d{44}', texto):
         candidatas.append(m.group(0))
 
-    # 2: 11 blocos de 4 dígitos com espaço simples
     for m in re.finditer(
         r'(\d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4} \d{4})',
         texto
     ):
         candidatas.append(re.sub(r'\s+', '', m.group(1)))
 
-    # 3: blocos de 4 dígitos com 1 a 4 espaços
     for m in re.finditer(r'(\d{4}\s{1,4}){10}\d{4}', texto):
         candidatas.append(re.sub(r'\D', '', m.group(0)))
 
-    # 4: sequência mista que resulte em 44 dígitos
     for m in re.finditer(r'\d[\d ]{42,58}\d', texto):
         apenas = re.sub(r'\D', '', m.group(0))
         if len(apenas) == 44:
@@ -92,83 +88,48 @@ def _buscar_chave_no_texto(texto: str):
     return None
 
 def _buscar_chave_por_contexto(texto: str):
-    """
-    Busca especificamente na linha após 'CHAVE DE ACESSO'.
-    Cobre todos os layouts: Keysystems, Venus, SICER, GAPLAN.
-    """
     texto = _limpar_texto(texto)
     linhas = texto.split('\n')
-
     for i, linha in enumerate(linhas):
         if 'CHAVE DE ACESSO' in linha.upper():
-
-            # Tenta extrair da própria linha (ex: SES COMERCIO - chave inline)
             chave = _buscar_chave_no_texto(linha)
             if chave:
                 return chave
-
-            # Verifica as próximas 5 linhas
             for j in range(i + 1, min(i + 6, len(linhas))):
                 chave = _buscar_chave_no_texto(linhas[j])
                 if chave:
                     return chave
-
-            # Tenta juntar as próximas linhas (chave quebrada entre linhas)
             bloco = ' '.join(linhas[i:min(i + 6, len(linhas))])
             chave = _buscar_chave_no_texto(bloco)
             if chave:
                 return chave
-
     return None
 
 def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
-    """
-    Extrai a chave de acesso NF-e do PDF.
-    Ordem: pdfplumber → PyPDF2 → OCR
-    """
-
-    # ── pdfplumber ─────────────────────────────────────────────────────────────
     if PDFPLUMBER_DISPONIVEL:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 texto_completo = ""
                 for page in pdf.pages:
-
-                    # 1. Texto corrido da página
-                    texto_pag = page.extract_text(
-                        x_tolerance=2,
-                        y_tolerance=2
-                    ) or ""
+                    texto_pag = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
                     texto_completo += texto_pag + "\n"
 
-                    # 2. Busca por contexto (linha após "CHAVE DE ACESSO")
                     chave = _buscar_chave_por_contexto(texto_pag)
-                    if chave:
-                        return chave, "texto"
+                    if chave: return chave, "texto"
 
-                    # 3. Busca direta no texto da página
                     chave = _buscar_chave_no_texto(texto_pag)
-                    if chave:
-                        return chave, "texto"
+                    if chave: return chave, "texto"
 
-                    # 4. Extração palavra a palavra agrupada por linha
                     try:
-                        words = page.extract_words(
-                            x_tolerance=3,
-                            y_tolerance=5,
-                            keep_blank_chars=False
-                        )
+                        words = page.extract_words(x_tolerance=3, y_tolerance=5, keep_blank_chars=False)
                         linhas_palavras = {}
                         for w in words:
                             y_key = round(float(w['top']) / 8) * 8
                             linhas_palavras.setdefault(y_key, []).append(w['text'])
-
                         for y_key in sorted(linhas_palavras):
                             linha = ' '.join(linhas_palavras[y_key])
                             chave = _buscar_chave_no_texto(linha)
-                            if chave:
-                                return chave, "texto"
-
+                            if chave: return chave, "texto"
                             so_digitos = re.sub(r'\D', '', linha)
                             if len(so_digitos) >= 44:
                                 for start in range(len(so_digitos) - 43):
@@ -178,12 +139,11 @@ def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
                     except Exception:
                         pass
 
-                    # 5. Busca por regiões (bbox)
                     try:
                         w, h = float(page.width), float(page.height)
                         regioes = [
-                            (w * 0.35, 0,       w, h * 0.30),
-                            (0,        0,       w, h * 0.25),
+                            (w * 0.35, 0,        w, h * 0.30),
+                            (0,        0,        w, h * 0.25),
                             (w * 0.35, h * 0.05, w, h * 0.40),
                         ]
                         for bbox in regioes:
@@ -191,25 +151,19 @@ def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
                                 recorte = page.within_bbox(bbox)
                                 txt = recorte.extract_text() or ""
                                 chave = _buscar_chave_por_contexto(txt) or _buscar_chave_no_texto(txt)
-                                if chave:
-                                    return chave, "texto"
+                                if chave: return chave, "texto"
                             except Exception:
                                 pass
                     except Exception:
                         pass
 
-                # 6. Busca no texto completo de todas as páginas
                 chave = _buscar_chave_por_contexto(texto_completo)
-                if chave:
-                    return chave, "texto"
+                if chave: return chave, "texto"
                 chave = _buscar_chave_no_texto(texto_completo)
-                if chave:
-                    return chave, "texto"
-
+                if chave: return chave, "texto"
         except Exception:
             pass
 
-    # ── PyPDF2 fallback ────────────────────────────────────────────────────────
     if PYPDF2_DISPONIVEL:
         try:
             reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -217,25 +171,20 @@ def extrair_chave_pdf(pdf_bytes: bytes) -> tuple:
             for page in reader.pages:
                 texto += (page.extract_text() or "") + "\n"
             chave = _buscar_chave_por_contexto(texto) or _buscar_chave_no_texto(texto)
-            if chave:
-                return chave, "texto"
+            if chave: return chave, "texto"
         except Exception:
             pass
 
-    # ── OCR ────────────────────────────────────────────────────────────────────
     if OCR_DISPONIVEL:
         try:
             paginas   = convert_from_bytes(pdf_bytes, dpi=300)
             texto_ocr = ""
             for pagina in paginas:
                 texto_ocr += pytesseract.image_to_string(
-                    pagina,
-                    lang="por+eng",
-                    config="--oem 3 --psm 6"
+                    pagina, lang="por+eng", config="--oem 3 --psm 6"
                 ) + "\n"
             chave = _buscar_chave_por_contexto(texto_ocr) or _buscar_chave_no_texto(texto_ocr)
-            if chave:
-                return chave, "ocr"
+            if chave: return chave, "ocr"
         except Exception:
             pass
 
@@ -250,14 +199,11 @@ def ler_estrutura_zip(zip_bytes: bytes) -> list:
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             for entry in zf.namelist():
-                if (entry.endswith("/")
-                        or "__MACOSX" in entry
-                        or os.path.basename(entry).startswith(".")):
+                if entry.endswith("/") or "__MACOSX" in entry or os.path.basename(entry).startswith("."):
                     continue
                 ext    = os.path.splitext(entry)[1].lower()
                 nome   = os.path.basename(entry)
                 partes = [p for p in entry.replace("\\", "/").split("/") if p.strip()]
-
                 if ext == ".zip":
                     inner     = ler_estrutura_zip(zf.read(entry))
                     pasta_pai = partes[-2] if len(partes) >= 2 else CATEGORIA_PADRAO
@@ -268,10 +214,8 @@ def ler_estrutura_zip(zip_bytes: bytes) -> list:
                 elif ext == ".pdf":
                     categoria = partes[0] if len(partes) >= 2 else CATEGORIA_PADRAO
                     resultado.append({
-                        "nome":      nome,
-                        "bytes":     zf.read(entry),
-                        "categoria": categoria,
-                        "caminho":   entry
+                        "nome": nome, "bytes": zf.read(entry),
+                        "categoria": categoria, "caminho": entry
                     })
     except zipfile.BadZipFile:
         st.error("ZIP inválido ou corrompido.")
@@ -282,18 +226,13 @@ def ler_xmls_zip(zip_bytes: bytes) -> list:
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             for entry in zf.namelist():
-                if (entry.endswith("/")
-                        or "__MACOSX" in entry
-                        or os.path.basename(entry).startswith(".")):
+                if entry.endswith("/") or "__MACOSX" in entry or os.path.basename(entry).startswith("."):
                     continue
                 ext = os.path.splitext(entry)[1].lower()
                 if ext == ".zip":
                     resultado.extend(ler_xmls_zip(zf.read(entry)))
                 elif ext == ".xml":
-                    resultado.append({
-                        "nome":  os.path.basename(entry),
-                        "bytes": zf.read(entry)
-                    })
+                    resultado.append({"nome": os.path.basename(entry), "bytes": zf.read(entry)})
     except zipfile.BadZipFile:
         st.error("ZIP de XMLs inválido ou corrompido.")
     return resultado
@@ -307,10 +246,8 @@ def normalizar_pdfs(uploads) -> list:
             resultado.extend(ler_estrutura_zip(f.read()))
         elif ext == ".pdf":
             resultado.append({
-                "nome":      f.name,
-                "bytes":     f.read(),
-                "categoria": CATEGORIA_PADRAO,
-                "caminho":   f.name
+                "nome": f.name, "bytes": f.read(),
+                "categoria": CATEGORIA_PADRAO, "caminho": f.name
             })
     return resultado
 
@@ -335,13 +272,11 @@ def extrair_chave_xml(xml_bytes: bytes) -> str:
         inf  = root.find(".//{%s}infNFe" % NAMESPACE_NFE)
         if inf is not None:
             chave = re.sub(r'\D', '', inf.get("Id", ""))
-            if len(chave) == 44:
-                return chave
+            if len(chave) == 44: return chave
         ch = root.find(".//{%s}chNFe" % NAMESPACE_NFE)
         if ch is not None and ch.text:
             chave = re.sub(r'\D', '', ch.text)
-            if len(chave) == 44:
-                return chave
+            if len(chave) == 44: return chave
     except Exception:
         pass
     return None
@@ -350,8 +285,7 @@ def extrair_info_xml(xml_bytes: bytes) -> dict:
     info = {"numero":"N/A","emitente":"N/A","valor":"N/A","data":"N/A","cfop":"N/A"}
     try:
         root = ET.fromstring(xml_bytes)
-        def tag(t):
-            return root.find(".//{%s}%s" % (NAMESPACE_NFE, t))
+        def tag(t): return root.find(".//{%s}%s" % (NAMESPACE_NFE, t))
         if tag("nNF")  is not None: info["numero"]  = tag("nNF").text
         if tag("vNF")  is not None: info["valor"]   = f"R$ {float(tag('vNF').text):,.2f}"
         if tag("CFOP") is not None: info["cfop"]    = tag("CFOP").text
@@ -408,11 +342,13 @@ with st.expander("📖 Estrutura esperada do ZIP de PDFs"):
         language=None
     )
 
+# Estado da sessão
 for key, default in [
     ("notas", {}),
     ("processado", False),
     ("categorias", []),
     ("cat_sem_pdf", None),
+    ("aplicar_versao", 0),   # ← NOVO: controla re-render dos selectbox
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -448,8 +384,9 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
         categorias_detectadas = sorted(set(
             p["categoria"] for p in lista_pdfs if p["categoria"] != CATEGORIA_PADRAO
         ))
-        st.session_state.categorias  = categorias_detectadas if categorias_detectadas else [CATEGORIA_PADRAO]
-        st.session_state.cat_sem_pdf = categorias_detectadas[0] if categorias_detectadas else CATEGORIA_PADRAO
+        st.session_state.categorias    = categorias_detectadas if categorias_detectadas else [CATEGORIA_PADRAO]
+        st.session_state.cat_sem_pdf   = categorias_detectadas[0] if categorias_detectadas else CATEGORIA_PADRAO
+        st.session_state.aplicar_versao = 0
 
         with st.expander("🗂️ Estrutura detectada no ZIP de PDFs", expanded=True):
             if lista_pdfs:
@@ -458,13 +395,12 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
             else:
                 st.info("Nenhum PDF enviado.")
 
-        total        = max(len(lista_pdfs) + len(lista_xmls), 1)
-        processados  = 0
-        lidos_texto  = 0
-        lidos_ocr    = 0
-        falhou_leit  = 0
+        total       = max(len(lista_pdfs) + len(lista_xmls), 1)
+        processados = 0
+        lidos_texto = 0
+        lidos_ocr   = 0
+        falhou_leit = 0
 
-        # Indexa XMLs pela chave
         xmls_por_chave = {}
         for arq in lista_xmls:
             chave = extrair_chave_xml(arq["bytes"])
@@ -479,7 +415,6 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
             processados += 1
             progress.progress(processados / total, text=f"Indexando XMLs... {processados}/{total}")
 
-        # Cruza PDFs → XMLs
         chaves_pdf = set()
         for arq in lista_pdfs:
             progress.progress(processados / total, text=f"Lendo PDF: {arq['nome']}...")
@@ -530,7 +465,6 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
             processados += 1
             progress.progress(processados / total, text=f"Cruzando... {processados}/{total}")
 
-        # XMLs sem PDF
         for chave, dados in xmls_por_chave.items():
             if chave not in chaves_pdf:
                 notas[chave] = {
@@ -577,12 +511,9 @@ if st.button("🔍 Processar", type="primary", use_container_width=True):
                 f"⚠️ **Divergência:** {total_pdfs} PDF(s) × "
                 f"{total_xmls} XML(s) × {cruzados} cruzamento(s) OK."
             )
-            if sem_chave > 0:
-                st.error(f"❌ {sem_chave} PDF(s) com chave não extraída.")
-            if sem_xml > 0:
-                st.warning(f"⚠️ {sem_xml} PDF(s) sem XML correspondente.")
-            if sem_pdf > 0:
-                st.warning(f"⚠️ {sem_pdf} XML(s) sem PDF correspondente.")
+            if sem_chave > 0: st.error(f"❌ {sem_chave} PDF(s) com chave não extraída.")
+            if sem_xml   > 0: st.warning(f"⚠️ {sem_xml} PDF(s) sem XML correspondente.")
+            if sem_pdf   > 0: st.warning(f"⚠️ {sem_pdf} XML(s) sem PDF correspondente.")
 
         if lidos_ocr   > 0: st.info(f"🔍 {lidos_ocr} PDF(s) lidos via OCR.")
         if falhou_leit > 0: st.warning(f"❌ {falhou_leit} PDF(s) não tiveram a chave extraída.")
@@ -606,11 +537,14 @@ if st.session_state.processado and st.session_state.notas:
         with col_btn:
             st.write(""); st.write("")
             if st.button("✅ Aplicar", use_container_width=True):
-                # Atualiza TODAS as notas sem PDF diretamente no session_state
+                # ── CORREÇÃO PRINCIPAL ──────────────────────────────────────
+                # Atualiza direto no session_state E incrementa versão
+                # para forçar re-render dos selectbox na Revisão Geral
                 for chave in list(st.session_state.notas.keys()):
                     if not st.session_state.notas[chave]["tem_pdf"]:
                         st.session_state.notas[chave]["categoria"] = cat_escolhida
-                st.session_state.cat_sem_pdf = cat_escolhida
+                st.session_state.cat_sem_pdf    = cat_escolhida
+                st.session_state.aplicar_versao += 1   # ← invalida cache dos selectbox
                 st.success(f"**{cat_escolhida}** aplicado a {len(sem_pdf_notas)} XML(s).")
                 st.rerun()
 
@@ -619,6 +553,7 @@ if st.session_state.processado and st.session_state.notas:
     st.divider()
     st.subheader("🏷️ 3. Revisão Geral")
     categorias_opcoes = st.session_state.categorias
+    versao = st.session_state.aplicar_versao   # ← usado na key dos selectbox
 
     col_f1, col_f2 = st.columns(2)
     filtro_status = col_f1.selectbox(
@@ -647,7 +582,6 @@ if st.session_state.processado and st.session_state.notas:
         cols[5].caption(dados["info"]["cfop"])
         cols[6].caption(dados.get("metodo_pdf","—"))
 
-        # Index sempre reflete a categoria atual da nota
         cat_atual = dados["categoria"]
         if cat_atual not in categorias_opcoes:
             cat_atual = categorias_opcoes[0]
@@ -656,7 +590,8 @@ if st.session_state.processado and st.session_state.notas:
         nova_cat = cols[7].selectbox(
             "", categorias_opcoes,
             index=idx,
-            key=f"cat_{chave}",
+            # ── CORREÇÃO: key inclui versão para forçar re-render ──
+            key=f"cat_{chave}_v{versao}",
             label_visibility="collapsed"
         )
         dados["categoria"] = nova_cat
